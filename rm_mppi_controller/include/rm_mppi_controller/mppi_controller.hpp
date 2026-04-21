@@ -83,14 +83,7 @@ private:
                      
 protected:
   Options opts_;
-
-  std::random_device rd_;
-  std::mt19937 gen_;
-  std::normal_distribution<float> noise_dist_{0.0, 1.0};
-  const float M_2PI_ = 2.0 * M_PI;
-
-  bool stop_obstacle_ = false;
-  Vec3f goal_pt_ = Vec3f::Zero();
+  
   size_t prev_waypoints_idx_ = 0;       // 上一次最近的路径点索引
   float min_cost_ = 0.0f;
   Eigen::Tensor<float, 2> u_prev_;     // 存储上一次的控制输入序列 step_T * dim_u

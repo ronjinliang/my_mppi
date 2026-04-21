@@ -1,4 +1,5 @@
 #include "rm_mppi_controller/mppi_controller.hpp"
+#include "rm_mppi_controller/utils.h"
 #include "nav2_core/exceptions.hpp"
 #include "nav2_util/geometry_utils.hpp"
 #include "nav2_util/node_utils.hpp"
@@ -12,45 +13,12 @@
 #include <execution>
 #include <cmath>
 
-/*
-
-    FollowPath:
-      plugin: "rm_mppi_controller::MPPIController"
-      frequency: 20.0
-      max_v: 1.5
-      max_w: 2.0  # default = 1.5
-      step_T: 100     # 
-      samples_K: 200 # 
-      lambda: 250.0  # 越大越随机，越小越趋向最优（但可能陷入局部最优） 大一点会更稳定但速度更慢
-      gamma_dv: 0.01   # 
-      gamma_dw: 0.01   # 
-      gamma_v: 0.2   # 
-      gamma_w: 0.5   # 
-      sigma_v: 0.4  # velocity 方差越大，速度会越快
-      sigma_w: 0.4  # omega
-      stage_cost_weight_x: 10.0
-      stage_cost_weight_y: 10.0
-      stage_cost_weight_yaw: 20.0
-      terminal_cost_weight_x: 10.0
-      terminal_cost_weight_y: 10.0
-      terminal_cost_weight_yaw: 20.0
-      obstacle_cost_weight: 100.0      # 一般避障权重
-      critical_weight: 500.0         # 严重惩罚权重 (安全边距内)
-      collision_cost: 10000.0       # 碰撞代价   太大会报错
-      collision_margin_distance: 0.5 # 安全边距 (米)
-      near_goal_distance: 0.5        # 接近目标距离，此距离内停用一般避障项
-      inflation_radius: 0.45
-      cost_scaling_factor: 3.0
-*/
-
 namespace rm_mppi_controller {
 
 void MPPIController::configure(
     const rclcpp_lifecycle::LifecycleNode::WeakPtr &parent, std::string name,
     std::shared_ptr<tf2_ros::Buffer> tf,
     std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_ros) {
-  // 初始化随机数发生器
-  std::normal_distribution<float> dist(0.0, 1.0);
 
   node_ = parent.lock();
   costmap_ros_ = costmap_ros;
@@ -103,13 +71,6 @@ geometry_msgs::msg::TwistStamped MPPIController::computeVelocityCommands(
   Vec3f x0( pose.pose.position.x, pose.pose.position.y,
     tf2::getYaw(pose.pose.orientation));
 
-  float delta_t = (x0.head<2>() - goal_pt_.head<2>()).norm();
-  if ( delta_t < opts_.near_goal_distance ) {
-    stop_obstacle_ = true;
-  } else {
-    stop_obstacle_ = false;
-  }
-
   // 寻找离当前车辆位置最近的参考路径点，并更新索引
   Vec2f search_pt = Vec2f( x0.x(), x0.y() );
   get_nearest_waypoint( search_pt, true );
@@ -157,15 +118,7 @@ void MPPIController::setPlan(const nav_msgs::msg::Path &path) {
   // 预计算弧长和路径点
   if (global_plan_.poses.empty()) return;
 
-  // 目标点
-  auto temp_pose = global_plan_.poses.back().pose;
-  float goal_x = temp_pose.position.x;
-  float goal_y = temp_pose.position.y;
-  float goal_yaw = 2 * std::atan2(temp_pose.orientation.z, temp_pose.orientation.w); // 2d yaw = 2 * atan2(z, w)
-  goal_pt_ = Vec3f(goal_x, goal_y, goal_yaw);
-
   path_points_size_ = global_plan_.poses.size();
-  
   path_arc_lengths_ = Eigen::Tensor<float, 2>(path_points_size_, 1); // 累积弧长数组
   path_points_      = Eigen::Tensor<float, 2>(path_points_size_, 3);  // x, y, yaw
   float cum_len = 0.0;
@@ -214,16 +167,19 @@ void MPPIController::calc_total_costs( const Vec3f &start_state ){
   Vec3f x0 = start_state;
   // 对每个采样轨迹进行前向仿真，计算成本
   // 并发计算总代价
+  unsigned int global_seed = node_->get_clock()->now().nanoseconds();
   std::for_each(std::execution::par_unseq, index_K_.begin(), index_K_.end(),
     [&](const size_t & k){
       Vec3f x = x0;
       Eigen::ArrayXf temp_stage_cost(opts_.step_T);
+      unsigned int seed = global_seed + k * 1664525u;
       // std::execution::par 允许算法在多个线程上并行处理数据，但‌不保证一定加速‌。
       std::for_each(std::execution::par, index_T_.begin(), index_T_.end(),
         [&](const size_t & t) {
           /// 采样噪声
-          epsilon_(k, t, 0) = noise_dist_(gen_) * opts_.std_v;
-          epsilon_(k, t, 1) = noise_dist_(gen_) * opts_.std_w;
+          unsigned int step_seed = seed + t * 104729u;
+          epsilon_(k, t, 0) = rand_gaussian(&step_seed) * opts_.std_v;
+          epsilon_(k, t, 1) = rand_gaussian(&step_seed) * opts_.std_w;
 
           // 生成带有噪声的控制输入, 在上一最优控制输入上叠加噪声
           Vec2f u = Vec2f::Zero();
@@ -237,11 +193,7 @@ void MPPIController::calc_total_costs( const Vec3f &start_state ){
           // 累加阶段成本，并加上控制输入成本项
           temp_stage_cost[t] = calc_stage_cost( x, u_v, t );
           temp_stage_cost[t] += calc_input_cost( u, t );
-          if ( stop_obstacle_ ) {
-            // goal approach cost
-          } else {
-            temp_stage_cost[t] += calc_obstacle_cost( x );
-          }
+          temp_stage_cost[t] += calc_obstacle_cost( x );
       });
 
       // 并发完后累加
@@ -339,11 +291,11 @@ float MPPIController::calc_stage_cost(const Vec3f &state, const float & u_v_t, c
   size_t proj_idx = get_projected_waypoint(search_pt);
 
   // 根据当前速度预测前向弧长距离（也可以使用固定值）
-  float forward_dist = std::max(0.5f, std::abs(u_v_t) * opts_.dt * t);
+  float forward_dist = std::abs(u_v_t) * opts_.dt * t;
   float target_arc = path_arc_lengths_(proj_idx) + forward_dist;
 
   // 手动实现二分查找：找到第一个弧长 >= target_arc 的索引
-  size_t low = 0;
+  size_t low = prev_waypoints_idx_;
   size_t high = path_points_size_ - 1;
   size_t target_idx = high;  // 默认最后一个（若所有弧长都小于 target_arc）
 
@@ -358,7 +310,6 @@ float MPPIController::calc_stage_cost(const Vec3f &state, const float & u_v_t, c
     }
   }
 
-  
   // 获取参考点坐标和朝向
   float ref_x = path_points_(target_idx, 0);
   float ref_y = path_points_(target_idx, 1);
@@ -367,10 +318,8 @@ float MPPIController::calc_stage_cost(const Vec3f &state, const float & u_v_t, c
   float dx = ref_x - state[0];
   float dy = ref_y - state[1];
   float dyaw = ref_yaw - state[2];
-  if (dyaw < -M_PI) dyaw += M_2PI_;
-  if (dyaw >  M_PI) dyaw -= M_2PI_;
-  // if (dyaw < -M_PI_2) dyaw += M_PI;
-  // if (dyaw >  M_PI_2) dyaw -= M_PI;
+  if (dyaw < -M_PI) dyaw += 2.0 * M_PI;
+  if (dyaw >  M_PI) dyaw -= 2.0 * M_PI;
   
   return opts_.stage_cost_weight[0] * dx*dx +
           opts_.stage_cost_weight[1] * dy*dy +
@@ -385,15 +334,20 @@ float MPPIController::calc_terminal_cost( const Vec3f & state, const size_t & k 
   float forward_dist = std::abs( u_v_T ) * opts_.step_T * opts_.dt;
   float target_arc = path_arc_lengths_(proj_idx) + forward_dist;
 
-  // 找到目标弧长对应的路径点索引
-  size_t target_idx = proj_idx;
-  for (size_t i = proj_idx; i < path_points_size_; ++i) {
-    if (path_arc_lengths_(i) >= target_arc) {
-        target_idx = i;
-        break;
+  size_t low = prev_waypoints_idx_;
+  size_t high = path_points_size_ - 1;
+  size_t target_idx = high;  // 默认最后一个（若所有弧长都小于 target_arc）
+
+  while (low <= high) {
+    size_t mid = ( low + high ) / 2;
+    if (path_arc_lengths_(mid) >= target_arc) {
+      target_idx = mid;
+      if (mid == 0) break;   // 已经是第一个，无需继续
+      high = mid - 1;        // 继续向左寻找更小的满足条件的索引
+    } else {
+      low = mid + 1;         // 向右搜索
     }
   }
-  target_idx = std::min(target_idx, path_points_size_ - 1);
   
   // 获取参考点坐标和朝向
   float ref_x = path_points_(target_idx, 0);
@@ -403,16 +357,12 @@ float MPPIController::calc_terminal_cost( const Vec3f & state, const size_t & k 
   float dx = ref_x - state[0];
   float dy = ref_y - state[1];
   float dyaw = ref_yaw - state[2];
-  if (dyaw < -M_PI) dyaw += M_2PI_;
-  if (dyaw >  M_PI) dyaw -= M_2PI_;
-  // 限制到-PI/2到-PI/2区间内可以倒着跑
-  // if (dyaw < -M_PI_2) dyaw += M_PI;
-  // if (dyaw >  M_PI_2) dyaw -= M_PI;
+  if (dyaw < -M_PI) dyaw += 2.0 * M_PI;
+  if (dyaw >  M_PI) dyaw -= 2.0 * M_PI;
 
   float terminal_cost =  opts_.terminal_cost_weight[0] * dx * dx + 
                           opts_.terminal_cost_weight[1] * dy * dy + 
                           opts_.terminal_cost_weight[2] * dyaw * dyaw;
-  // RCLCPP_INFO(node_->get_logger(), "terminal cost: %.2f, dyaw:%.2f", terminal_cost, dyaw);
   return terminal_cost;
 }
 
