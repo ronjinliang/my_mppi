@@ -1,0 +1,8 @@
+<!-- 这个是编译之后可执行文件的名称，对应 CMakeLists.txt 里面 add_library 创建的 so 动态库 -->
+<library path="rm_mppi_controller_plugin">  <!-- executable file name (SHARED lib.so)  -->
+    <class type="rm_mppi_controller::MPPIController" base_class_type="nav2_core::Controller">
+        <description>
+            This class implements a custom controller.
+        </description>
+    </class>
+</library>
