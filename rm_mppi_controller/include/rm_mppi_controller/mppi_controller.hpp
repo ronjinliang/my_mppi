@@ -6,10 +6,12 @@
 #include <vector>
 
 #include "rm_mppi_controller/eigen_types.h"
+#include "rm_mppi_controller/mppi_params.h"
 
 #include "nav2_core/controller.hpp"
 #include "nav2_util/robot_utils.hpp"
 
+#include <CL/cl.h>
 
 namespace rm_mppi_controller {
 
@@ -35,7 +37,7 @@ public:
     Vec3f stage_cost_weight = Vec3f(50.0, 50.0, 1.0);     // 阶段成本权重  x y yaw
     Vec3f terminal_cost_weight = Vec3f(50.0, 50.0, 1.0);  // 终端成本权重  x y yaw
     // 避障代价参数
-    bool use_obstacle_cost = true;             // 是否启用避障代价  unused
+    bool use_obstacle_cost = true;             // 避障代价
     float obstacle_cost_weight = 5.0f;         // 一般避障权重
     float critical_weight = 100.0f;            // 严重惩罚权重 (安全边距内)
     float collision_cost = 1000000.0f;         // 碰撞代价
@@ -48,7 +50,7 @@ public:
 
 public:
   MPPIController() = default;
-  ~MPPIController() override = default;
+  ~MPPIController() override;
   void configure(
       const rclcpp_lifecycle::LifecycleNode::WeakPtr &parent, std::string name,
       std::shared_ptr<tf2_ros::Buffer> tf,
@@ -65,37 +67,43 @@ public:
                      const bool &percentage) override;
 
 private:
-    void calc_total_costs( const Vec3f &start_state );
-    float calc_obstacle_cost( const Vec3f & state );  // 计算单点避障代价
-    float calc_input_cost( const Vec2f & u, const size_t & t );
-    float calc_stage_cost( const Vec3f & state, const float & u_v_t, const size_t & t );
-    float calc_terminal_cost( const Vec3f & state, const size_t & k );
-    void calc_weights();
-    void calc_control_seq();
-    Vec3f calc_next_state( const Vec3f & state, const Vec2f & input );
-    void limit_input( Vec2f & input );
-    size_t get_projected_waypoint(const Vec2f &pt);
-    size_t get_nearest_waypoint( Vec2f & pt, bool update_prev_idx = false );
-    void smooth_control_seq();
-    void shift_control_seq();
-    void publish_local_plan(const Vec3f &start_state);
-    void update_parameters();
+  void calc_total_costs( const Vec3f &start_state );
+  void calc_weights();
+  void calc_control_seq();
+  Vec3f calc_next_state( const Vec3f & state, const Vec2f & input );
+  void limit_input( Vec2f & input );
+  size_t find_nearest_waypoint( Vec2f & pt );
+  void smooth_control_seq();
+  void shift_control_seq();
+  void publish_local_plan(const Vec3f &start_state);
+  void update_parameters();
+
+private:
+  char* read_kernel_file(const char* filename, size_t* length);
+  void initOpenCL();
+  void releaseOpenCL();
+  void copyPathToDevice();
+  void copyCostmapToDevice();
+  void updateMPPIParams( const Vec3f &start_state );
                      
 protected:
   Options opts_;
-  
+
+  const float M_2PI_ = 2.0 * M_PI;
+
+  Vec3f goal_pt_ = Vec3f::Zero();
   size_t prev_waypoints_idx_ = 0;       // 上一次最近的路径点索引
   float min_cost_ = 0.0f;
-  Eigen::Tensor<float, 2> u_prev_;     // 存储上一次的控制输入序列 step_T * dim_u
-  Eigen::Tensor<float, 3> epsilon_;    // sample_K * step_T * dim_u
-  Eigen::Tensor<float, 2> w_epsilon_;  // 存储加权后的噪声        samples_K * dim_u
+  Eigen::Tensor<float, 2, Eigen::RowMajor> u_prev_;     // 存储上一次的控制输入序列 step_T * dim_u
+  Eigen::Tensor<float, 3, Eigen::RowMajor> epsilon_;    // sample_K * step_T * dim_u
+  Eigen::Tensor<float, 2, Eigen::RowMajor> w_epsilon_;  // 存储加权后的噪声        samples_K * dim_u
   Eigen::ArrayXf costs_;               // 存储每条采样轨迹的总成本 samples_K * 1
   Eigen::ArrayXf weights_;             // 存储每条采样轨迹的权重 samples_K
-  Eigen::Tensor<float, 2> path_arc_lengths_; // 路径累积弧长数组（从起点开始沿路径的累积距离）
-  Eigen::Tensor<float, 2> path_points_;  // x, y, yaw  // 路径点数组（存储每个点的位置和朝向，便于快速访问）
+  Eigen::Tensor<float, 2, Eigen::RowMajor> path_arc_lengths_; // 路径累积弧长数组（从起点开始沿路径的累积距离）
+  Eigen::Tensor<float, 2, Eigen::RowMajor> path_points_;  // x, y, yaw  // 路径点数组（存储每个点的位置和朝向，便于快速访问）
   size_t path_points_size_ = 0;
 
-  // 用于并发计算，暂时先用串行计算
+  // 用于并发计算
   std::vector<size_t> index_K_;
   std::vector<size_t> index_T_;
 
@@ -109,7 +117,31 @@ protected:
 
   // publish local plan for visualization
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr local_plan_pub_;
+
+  // OpenCL 参数
+  bool has_init_cl_ = false;
+  std::string cl_kernel_file_;       // .cl 文件路径
+  std::string cl_kernel_name_;       // .cl 文件名字
+  std::string cl_mppi_params_dir_;   // 存放结构体的路径
+
+  cl_int cl_ret_;
+  cl_platform_id cl_platform_;
+  cl_device_id cl_device_;
+  cl_context cl_context_;
+  cl_command_queue cl_queue_;
+  cl_program cl_program_;
+  cl_kernel cl_kernel_;
+
+  // OpenCL buffer
+  cl_mem cl_u_prev_;
+  cl_mem cl_costs_;
+  cl_mem cl_epsilon_;
+  cl_mem cl_path_points_;
+  cl_mem cl_arc_lengths_;
+  cl_mem cl_costmap_;
   
+  MPPIParams cl_mps_;
+  cl_mem cl_mps_buf_;
 };
 
 } // namespace rm_mppi_controller
