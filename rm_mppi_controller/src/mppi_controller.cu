@@ -1,5 +1,4 @@
 #include "rm_mppi_controller/mppi_controller.hpp"
-#include "rm_mppi_controller/utils.h"
 #include "nav2_core/exceptions.hpp"
 #include "nav2_util/geometry_utils.hpp"
 #include "nav2_util/node_utils.hpp"
@@ -13,12 +12,375 @@
 #include <execution>
 #include <cmath>
 
+// CUDA 头文件
+#include <cuda_runtime.h>
+#include <curand_kernel.h>
+
 namespace rm_mppi_controller {
+
+// -------------------------------------------------------------------
+// 设备端辅助函数
+// -------------------------------------------------------------------
+
+__device__ float calc_obstacle_cost_device(
+  float x, float y,
+  const unsigned char *costmap_data, int width, int height,
+  float resolution, float origin_x, float origin_y,
+  float inflation_radius, float cost_scaling_factor,
+  float inscribed_radius,
+  float obstacle_cost_weight, float critical_weight,
+  float collision_cost, float collision_margin_distance){
+
+  // 世界坐标转栅格索引
+  int mx = (int)((x - origin_x) / resolution);
+  int my = (int)((y - origin_y) / resolution);
+  if (mx < 0 || mx >= width || my < 0 || my >= height) {
+    return 0.0f; // 超出地图边界，无障碍
+  }
+  unsigned char cost = costmap_data[my * width + mx];
+  if (cost <= 0) { // FREE_SPACE = 0
+    return 0.0f;
+  }
+  if (cost >= 254) { // LETHAL_OBSTACLE
+    return collision_cost;
+  }
+  // 使用膨胀层参数计算距离
+  if (inflation_radius > 0.0f && cost_scaling_factor > 0.0f) {
+    float dist = (logf(254.0f) - logf((float)cost)) / cost_scaling_factor + inscribed_radius;
+    if (dist < inscribed_radius) dist = inscribed_radius;
+    float max_penalty_dist = inflation_radius;
+    float penalty = 0.0f;
+    if (dist <= collision_margin_distance) {
+      penalty = critical_weight * (collision_margin_distance - dist);
+    } else if (dist < max_penalty_dist) {
+      penalty = obstacle_cost_weight * (max_penalty_dist - dist);
+    }
+    return penalty;
+  } else {
+    // 无膨胀参数，直接线性缩放
+    return obstacle_cost_weight * ((float)cost / 254.0f);
+  }
+}
+
+__device__ float calc_stage_cost_device(
+  float x, float y, float yaw, int prev_waypoints_idx, 
+  const float *path_points, const float *arc_lengths, int num_points,
+  float *stage_weight, float dt, float u_v, int t){
+  // 1. 找欧氏最近点索引
+  int nearest_idx = 0;
+  float best_dist2 = 1e20f;
+
+  // 基于 prev_waypoints_idx_ 或上一次的投影点，在局部窗口内搜索（前后各10个点）。
+  int start = prev_waypoints_idx;
+  if ( start > 10 ) start = prev_waypoints_idx - 10;
+  else start = 0;
+  int end = prev_waypoints_idx + 10;
+  if ( end > num_points - 1 ) end = num_points - 1;
+  for (int i = start; i < end; ++i) {
+    float dx = path_points[i*3] - x;
+    float dy = path_points[i*3+1] - y;
+    float d2 = dx*dx + dy*dy;
+    if (d2 < best_dist2) {
+      best_dist2 = d2;
+      nearest_idx = i;
+    }
+  }
+
+  // 确保投影点不会小于上一个参考点（避免倒退）
+  if (nearest_idx < prev_waypoints_idx) nearest_idx = prev_waypoints_idx;
+
+  // 2. 计算前向投影距离
+  float forward_dist = fabs(u_v) * dt * t;
+  if (forward_dist < 0.5f) forward_dist = 0.5f;
+  float target_arc = arc_lengths[nearest_idx] + forward_dist;
+
+  // 3. 二分查找目标弧长对应的索引
+  int low = 0, high = num_points - 1;
+  int target_idx = high;  // 默认最后一个
+  while (low <= high) {
+    int mid = (low + high) / 2;
+    if (arc_lengths[mid] >= target_arc) {
+      target_idx = mid;
+      high = mid - 1;
+    } else {
+      low = mid + 1;
+    }
+  }
+
+  // 4. 获取参考点坐标和朝向
+  float ref_x = path_points[target_idx*3];
+  float ref_y = path_points[target_idx*3+1];
+  float ref_yaw = path_points[target_idx*3+2];
+
+  // 5. 计算偏差
+  float dx = ref_x - x;
+  float dy = ref_y - y;
+  float dyaw = ref_yaw - yaw;
+  if (dyaw < -1.5708f) dyaw += 3.14159f;
+  if (dyaw >  1.5708f) dyaw -= 3.14159f;
+
+  return stage_weight[0] * dx*dx + stage_weight[1] * dy*dy + stage_weight[2] * dyaw*dyaw;
+}
+
+__device__ float calc_terminal_cost_device(
+  float x, float y, float yaw, int prev_waypoints_idx,
+  const float *path_points, const float *arc_lengths, int num_points,
+  float *terminal_weight, float dt, float u_v, float T){
+
+  // 1. 找欧氏最近点索引
+  int nearest_idx = 0;
+  float best_dist2 = 1e20f;
+
+  // 基于 prev_waypoints_idx_ 或上一次的投影点，在局部窗口内搜索（前后各10个点）。
+  int start = prev_waypoints_idx;
+  if ( start > 10 ) start = prev_waypoints_idx - 10;
+  else start = 0;
+  int end = prev_waypoints_idx + 10;
+  if ( end > num_points - 1 ) end = num_points - 1;
+  for (int i = start; i < end; ++i) {
+    float dx = path_points[i*3] - x;
+    float dy = path_points[i*3+1] - y;
+    float d2 = dx*dx + dy*dy;
+    if (d2 < best_dist2) {
+      best_dist2 = d2;
+      nearest_idx = i;
+    }
+  }
+
+  // 确保投影点不会小于上一个参考点（避免倒退）
+  if (nearest_idx < prev_waypoints_idx) nearest_idx = prev_waypoints_idx;
+
+  // 2. 计算前向投影距离
+  float forward_dist = fabs(u_v) * T * dt;
+  if (forward_dist < 0.5f) forward_dist = 0.5f;
+  float target_arc = arc_lengths[nearest_idx] + forward_dist;
+
+  //   TODO 这个应该错了
+  int target_idx = nearest_idx;
+  for (int i = target_idx; i < num_points; ++i) {
+    if (arc_lengths[i] >= target_arc) {
+        target_idx = i;
+        break;
+    }
+  }
+
+  // // 3.二分查找目标弧长对应的索引
+  // int low = 0, high = cl_mps->path_points_size - 1;
+  // int target_idx = high;
+  // while ( low <= high ) {
+  //     int mid = ( low + high ) / 2;
+  //     if ( cl_arc_lengths[mid] >= target_arc ) {
+  //         target_idx = mid;
+  //         high = mid - 1;
+  //     } else {
+  //         low = mid + 1;
+  //     }
+  // }
+
+  float ref_x = path_points[target_idx*3];
+  float ref_y = path_points[target_idx*3+1];
+  float ref_yaw = path_points[target_idx*3+2];
+
+  float dx = ref_x - x;
+  float dy = ref_y - y;
+  float dyaw = ref_yaw - yaw;
+  if (dyaw < -1.5708f) dyaw += 3.14159f;
+  if (dyaw >  1.5708f) dyaw -= 3.14159f;
+
+  return terminal_weight[0] * dx*dx + terminal_weight[1] * dy*dy + terminal_weight[2] * dyaw*dyaw;
+}
+
+// -------------------------------------------------------------------
+// CUDA Kernel：计算所有采样轨迹的总成本
+// -------------------------------------------------------------------
+__global__ void computeTrajectoryCostsKernel(
+  float *d_costs,                     // 输出，长度为 K
+  float *d_epsilon,           // 新增：输出噪声 (K*T*2)
+  const float *d_u_prev,              // 控制序列 (T x 2)，行主序
+  const float *d_path_points,         // 路径点 (N x 3)
+  const float *d_arc_lengths,         // 弧长 (N)
+  int prev_waypoints_idx,
+  int num_points,
+  const unsigned char *d_costmap_data,// 代价地图数据
+  int costmap_width, int costmap_height,
+  float costmap_resolution, float costmap_origin_x, float costmap_origin_y,
+  float inflation_radius, float cost_scaling_factor, float inscribed_radius,
+  float dt, int T, float max_v, float max_w,
+  float gamma_dv, float gamma_dw, float gamma_v, float gamma_w,
+  float std_v, float std_w,
+  float sigma_0, float sigma_1,       // sigma 对角线元素
+  float stage_weight_x, float stage_weight_y, float stage_weight_yaw,
+  float terminal_weight_x, float terminal_weight_y, float terminal_weight_yaw,
+  float obstacle_cost_weight, float critical_weight,
+  float collision_cost, float collision_margin_distance,
+  float start_x, float start_y, float start_yaw,
+  bool stop_obstacle, int K){
+
+  int k = blockIdx.x * blockDim.x + threadIdx.x;
+  if (k >= K) return;
+
+  // 初始化 curand 状态（每个线程独立）
+  curandState state;
+  curand_init(clock64() + k, 0, 0, &state);
+
+  // 当前状态
+  float x = start_x;
+  float y = start_y;
+  float yaw = start_yaw;
+
+  float total_cost = 0.0f;
+  float u_v_prev = d_u_prev[0];       // t=0 的控制输入（用于输入成本中的差分项）
+  float u_w_prev = d_u_prev[1];
+
+  float u_v = 0.f;
+  float u_w = 0.f;
+
+  for (int t = 0; t < T; ++t) {
+    // 从 d_u_prev 读取当前时刻的控制输入（未加噪声）
+    float u_v_nominal = d_u_prev[t * 2];
+    float u_w_nominal = d_u_prev[t * 2 + 1];
+    // 生成高斯噪声
+    float noise_v = curand_normal(&state) * std_v;
+    float noise_w = curand_normal(&state) * std_w;
+
+    // 存储噪声到 d_epsilon
+    d_epsilon[((k * T) + t) * 2 + 0] = noise_v;
+    d_epsilon[((k * T) + t) * 2 + 1] = noise_w;
+
+    u_v = u_v_nominal + noise_v;
+    u_w = u_w_nominal + noise_w;
+    // 限幅
+    if (u_v > max_v) u_v = max_v;
+    if (u_v < -max_v) u_v = -max_v;
+    if (u_w > max_w) u_w = max_w;
+    if (u_w < -max_w) u_w = -max_w;
+
+    // 更新状态
+    x += u_v * cosf(yaw) * dt;
+    y += u_v * sinf(yaw) * dt;
+    yaw += u_w * dt;
+    // 规范化 yaw
+    if (yaw > 3.14159f) yaw -= 2*3.14159f;
+    if (yaw < -3.14159f) yaw += 2*3.14159f;
+
+    // 计算阶段成本
+    float stage_cost = calc_stage_cost_device(x, y, yaw, prev_waypoints_idx,
+        d_path_points, d_arc_lengths, num_points,
+        (float[]){stage_weight_x, stage_weight_y, stage_weight_yaw},
+        dt, u_v, t);
+    // 输入成本
+    float du_v = u_v - u_v_prev;
+    float du_w = u_w - u_w_prev;
+    float input_cost = gamma_dv * du_v*du_v / sigma_0 +
+                        gamma_dw * du_w*du_w / sigma_1 +
+                        gamma_v * u_v*u_v / sigma_0 +
+                        gamma_w * u_w*u_w / sigma_1;
+    stage_cost += input_cost;
+
+    if (!stop_obstacle) {
+      float obs_cost = calc_obstacle_cost_device(x, y,
+        d_costmap_data, costmap_width, costmap_height,
+        costmap_resolution, costmap_origin_x, costmap_origin_y,
+        inflation_radius, cost_scaling_factor, inscribed_radius,
+        obstacle_cost_weight, critical_weight,
+        collision_cost, collision_margin_distance);
+      stage_cost += obs_cost;
+    }
+
+    total_cost += stage_cost;
+
+    // 更新上一时刻控制量（用于下一步的差分）
+    u_v_prev = u_v;
+    u_w_prev = u_w;
+  }
+
+  // 终端成本
+  float terminal_cost = calc_terminal_cost_device(x, y, yaw, prev_waypoints_idx, 
+      d_path_points, d_arc_lengths, num_points,
+      (float[]){terminal_weight_x, terminal_weight_y, terminal_weight_yaw},
+      dt, u_v, T);
+  total_cost += terminal_cost;
+
+  d_costs[k] = total_cost;
+}
+
+// -------------------------------------------------------------------
+// MPPIController 类成员函数实现（修改 calc_total_costs 及其他必要部分）
+// -------------------------------------------------------------------
+
+MPPIController::MPPIController(){
+  // 初始化随机数生成器（CPU端仍保留，以备不时之需）
+  gen_.seed(rd_());
+}
+
+MPPIController::~MPPIController(){
+  freeDeviceMemory();
+}
+
+void MPPIController::allocateDeviceMemory(){
+  // 分配 costs 数组
+  cudaMalloc(&d_costs_, opts_.samples_K * sizeof(float));
+  size_t epsilon_bytes = opts_.samples_K * opts_.step_T * opts_.dim_u * sizeof(float);
+  cudaMalloc(&d_epsilon_, epsilon_bytes);
+}
+
+void MPPIController::freeDeviceMemory(){
+  if (d_costs_) cudaFree(d_costs_);
+  if (d_epsilon_) cudaFree(d_epsilon_);
+  if (d_path_points_) cudaFree(d_path_points_);
+  if (d_arc_lengths_) cudaFree(d_arc_lengths_);
+  if (d_costmap_data_) cudaFree(d_costmap_data_);
+  d_costs_ = nullptr;
+  d_epsilon_ = nullptr;
+  d_path_points_ = nullptr;
+  d_arc_lengths_ = nullptr;
+  d_costmap_data_ = nullptr;
+}
+
+void MPPIController::copyPathToDevice(){
+  if (path_points_size_ == 0) return;
+  // 分配设备内存（如果大小变化则重新分配）
+  size_t points_bytes = path_points_size_ * 3 * sizeof(float);
+  size_t arcs_bytes = path_points_size_ * sizeof(float);
+  if (d_path_points_) cudaFree(d_path_points_);
+  if (d_arc_lengths_) cudaFree(d_arc_lengths_);
+  cudaMalloc(&d_path_points_, points_bytes);
+  cudaMalloc(&d_arc_lengths_, arcs_bytes);
+  // 拷贝数据
+  cudaMemcpy(d_path_points_, path_points_.data(), points_bytes, cudaMemcpyHostToDevice);
+  cudaMemcpy(d_arc_lengths_, path_arc_lengths_.data(), arcs_bytes, cudaMemcpyHostToDevice);
+}
+
+void MPPIController::copyCostmapToDevice(){
+  if (!costmap_) return;
+  unsigned int size_x = costmap_->getSizeInCellsX();
+  unsigned int size_y = costmap_->getSizeInCellsY();
+  size_t map_bytes = size_x * size_y * sizeof(unsigned char);
+  // 如果大小改变或未分配，重新分配
+  if (d_costmap_data_ == nullptr || d_costmap_size_x_ != (int)size_x || d_costmap_size_y_ != (int)size_y) {
+    if (d_costmap_data_) cudaFree(d_costmap_data_);
+    cudaMalloc(&d_costmap_data_, map_bytes);
+    d_costmap_size_x_ = size_x;
+    d_costmap_size_y_ = size_y;
+  }
+  // 拷贝代价地图数据
+  cudaMemcpy(d_costmap_data_, costmap_->getCharMap(), map_bytes, cudaMemcpyHostToDevice);
+  // 同时拷贝元数据（分辨率、原点等）
+  d_costmap_resolution_ = costmap_->getResolution();
+  d_costmap_origin_x_ = costmap_->getOriginX();
+  d_costmap_origin_y_ = costmap_->getOriginY();
+  // 获取内接圆半径（从 layered costmap 中获取）
+  d_inscribed_radius_ = costmap_ros_->getLayeredCostmap()->getInscribedRadius();
+  d_inflation_radius_ = opts_.inflation_radius;
+  d_cost_scaling_factor_ = opts_.cost_scaling_factor;
+}
 
 void MPPIController::configure(
     const rclcpp_lifecycle::LifecycleNode::WeakPtr &parent, std::string name,
     std::shared_ptr<tf2_ros::Buffer> tf,
     std::shared_ptr<nav2_costmap_2d::Costmap2DROS> costmap_ros) {
+  // 初始化随机数发生器
+  std::normal_distribution<float> dist(0.0, 1.0);
 
   node_ = parent.lock();
   costmap_ros_ = costmap_ros;
@@ -27,7 +389,6 @@ void MPPIController::configure(
 
   tf_ = tf;
   plugin_name_ = name;
-  
 }
 
 void MPPIController::cleanup() { RCLCPP_INFO(node_->get_logger(), "清理控制器：%s 类型为 rm_mppi_controller::MPPIController", plugin_name_.c_str()); }
@@ -41,7 +402,8 @@ void MPPIController::activate() {
 
   // update 参数
   update_parameters();
-  RCLCPP_INFO(node_->get_logger(),"update MPPI 完成!!!!!!!!!!");
+
+  RCLCPP_INFO(node_->get_logger(),"update MPPI 控制器完成!!!!!!!!!!");
 }
 
 void MPPIController::deactivate() { RCLCPP_INFO(node_->get_logger(), "停用控制器：%s 类型为 rm_mppi_controller::MPPIController", plugin_name_.c_str());}
@@ -71,6 +433,13 @@ geometry_msgs::msg::TwistStamped MPPIController::computeVelocityCommands(
   Vec3f x0( pose.pose.position.x, pose.pose.position.y,
     tf2::getYaw(pose.pose.orientation));
 
+  float delta_t = (x0.head<2>() - goal_pt_.head<2>()).norm();
+  if ( delta_t < opts_.near_goal_distance ) {
+    stop_obstacle_ = true;
+  } else {
+    stop_obstacle_ = false;
+  }
+
   // 寻找离当前车辆位置最近的参考路径点，并更新索引
   Vec2f search_pt = Vec2f( x0.x(), x0.y() );
   get_nearest_waypoint( search_pt, true );
@@ -86,7 +455,6 @@ geometry_msgs::msg::TwistStamped MPPIController::computeVelocityCommands(
 
   // calculate w_k * epsilon_k
   calc_control_seq();
-
 
   // 可视化最优轨迹
   publish_local_plan(x0);
@@ -106,7 +474,6 @@ geometry_msgs::msg::TwistStamped MPPIController::computeVelocityCommands(
   std::chrono::steady_clock::time_point t2 = std::chrono::steady_clock::now();
   auto time_used = std::chrono::duration_cast<std::chrono::duration<double>>(t2 - t1);
   RCLCPP_INFO( node_->get_logger(), "[computeVelocityCommands]:%.5fs", time_used.count() );
-  
   return cmd_vel;
 }
 
@@ -118,9 +485,17 @@ void MPPIController::setPlan(const nav_msgs::msg::Path &path) {
   // 预计算弧长和路径点
   if (global_plan_.poses.empty()) return;
 
+  // 目标点
+  auto temp_pose = global_plan_.poses.back().pose;
+  float goal_x = temp_pose.position.x;
+  float goal_y = temp_pose.position.y;
+  float goal_yaw = 2 * std::atan2(temp_pose.orientation.z, temp_pose.orientation.w); // 2d yaw = 2 * atan2(z, w)
+  goal_pt_ = Vec3f(goal_x, goal_y, goal_yaw);
+
   path_points_size_ = global_plan_.poses.size();
-  path_arc_lengths_ = Eigen::Tensor<float, 2>(path_points_size_, 1); // 累积弧长数组
-  path_points_      = Eigen::Tensor<float, 2>(path_points_size_, 3);  // x, y, yaw
+  
+  path_arc_lengths_ = Eigen::Tensor<float, 2, Eigen::RowMajor>(path_points_size_, 1); // 累积弧长数组
+  path_points_      = Eigen::Tensor<float, 2, Eigen::RowMajor>(path_points_size_, 3);  // x, y, yaw
   float cum_len = 0.0;
   path_arc_lengths_(0) = cum_len;
 
@@ -152,6 +527,8 @@ void MPPIController::setPlan(const nav_msgs::msg::Path &path) {
     path_points_(i, 0) = x1;   path_points_(i, 1) = y1;   path_points_(i, 2) = yaw1;
     x0 = x1;                   y0 = y1;
   }
+
+  copyPathToDevice();
   
   RCLCPP_INFO(node_->get_logger(), "Path arc length: %.2f m", cum_len);
   RCLCPP_INFO(node_->get_logger(), "new global plan size: %zu", path_points_size_);
@@ -164,44 +541,65 @@ void MPPIController::setSpeedLimit(const double &speed_limit,
 }
 
 void MPPIController::calc_total_costs( const Vec3f &start_state ){
-  Vec3f x0 = start_state;
-  // 对每个采样轨迹进行前向仿真，计算成本
-  // 并发计算总代价
-  unsigned int global_seed = node_->get_clock()->now().nanoseconds();
-  std::for_each(std::execution::par_unseq, index_K_.begin(), index_K_.end(),
-    [&](const size_t & k){
-      Vec3f x = x0;
-      Eigen::ArrayXf temp_stage_cost(opts_.step_T);
-      unsigned int seed = global_seed + k * 1664525u;
-      // std::execution::par 允许算法在多个线程上并行处理数据，但‌不保证一定加速‌。
-      std::for_each(std::execution::par, index_T_.begin(), index_T_.end(),
-        [&](const size_t & t) {
-          /// 采样噪声
-          unsigned int step_seed = seed + t * 104729u;
-          epsilon_(k, t, 0) = rand_gaussian(&step_seed) * opts_.std_v;
-          epsilon_(k, t, 1) = rand_gaussian(&step_seed) * opts_.std_w;
+  // 确保设备内存已分配
+  if (d_costs_ == nullptr) {
+      allocateDeviceMemory();
+  }
+  // 拷贝代价地图（每次控制周期都需要更新）
+  copyCostmapToDevice();
 
-          // 生成带有噪声的控制输入, 在上一最优控制输入上叠加噪声
-          Vec2f u = Vec2f::Zero();
-          float u_v = u_prev_(t, 0) + epsilon_(k, t, 0);
-          float u_w = u_prev_(t, 1) + epsilon_(k, t, 1);
-          u = Vec2f(u_v, u_w);
+  // 拷贝 u_prev_ 到设备（注意 u_prev_ 是 Eigen::Tensor，需要提取数据指针）
+  // 注意：u_prev_ 尺寸为 (step_T, dim_u)
+  float *h_u_prev = u_prev_.data(); // Eigen::Tensor 数据是连续的
+  float *d_u_prev = nullptr;
+  cudaMalloc(&d_u_prev, opts_.step_T * opts_.dim_u * sizeof(float));
+  cudaMemcpy(d_u_prev, h_u_prev, opts_.step_T * opts_.dim_u * sizeof(float), cudaMemcpyHostToDevice);
+  // RCLCPP_INFO(node_->get_logger(), "Before kernel: sigma_0=%.6f, sigma_1=%.6f", opts_.sigma(0,0), opts_.sigma(1,1));
+  // 启动 kernel
+  int threads = 256;
+  int blocks = (opts_.samples_K + threads - 1) / threads;
+  computeTrajectoryCostsKernel<<<blocks, threads>>>(
+    d_costs_,
+    d_epsilon_,
+    d_u_prev,
+    d_path_points_,
+    d_arc_lengths_,
+    prev_waypoints_idx_,
+    path_points_size_,
+    d_costmap_data_,
+    d_costmap_size_x_, d_costmap_size_y_,
+    d_costmap_resolution_, d_costmap_origin_x_, d_costmap_origin_y_,
+    d_inflation_radius_, d_cost_scaling_factor_, d_inscribed_radius_,
+    opts_.dt, opts_.step_T, opts_.max_v, opts_.max_w,
+    opts_.gamma_dv, opts_.gamma_dw, opts_.gamma_v, opts_.gamma_w,
+    opts_.std_v, opts_.std_w,
+    opts_.sigma(0,0), opts_.sigma(1,1),
+    opts_.stage_cost_weight.x(), opts_.stage_cost_weight.y(), opts_.stage_cost_weight.z(),
+    opts_.terminal_cost_weight.x(), opts_.terminal_cost_weight.y(), opts_.terminal_cost_weight.z(),
+    opts_.obstacle_cost_weight, opts_.critical_weight,
+    opts_.collision_cost, opts_.collision_margin_distance,
+    start_state.x(), start_state.y(), start_state.z(),
+    stop_obstacle_, opts_.samples_K);
 
-          limit_input(u);
-          x = calc_next_state( x, u );
+  cudaDeviceSynchronize();  // 等待 kernel 完成
+  cudaError_t err = cudaGetLastError();
+  if (err != cudaSuccess) {
+      RCLCPP_ERROR(node_->get_logger(), "CUDA kernel error: %s", cudaGetErrorString(err));
+  }
 
-          // 累加阶段成本，并加上控制输入成本项
-          temp_stage_cost[t] = calc_stage_cost( x, u_v, t );
-          temp_stage_cost[t] += calc_input_cost( u, t );
-          temp_stage_cost[t] += calc_obstacle_cost( x );
-      });
+  // 将 costs 拷贝回主机
+  cudaMemcpy(costs_.data(), d_costs_, opts_.samples_K * sizeof(float), cudaMemcpyDeviceToHost);
 
-      // 并发完后累加
-      costs_[k] = temp_stage_cost.sum();
+  // 拷贝 epsilon 回主机（epsilon_ 是 Eigen::Tensor，需要连续内存）
+  cudaMemcpy(epsilon_.data(), d_epsilon_, opts_.samples_K * opts_.step_T * opts_.dim_u * sizeof(float), cudaMemcpyDeviceToHost);
 
-      // 添加终端成本
-      costs_[k] += calc_terminal_cost( x, k );
-    });
+  // 释放临时设备内存
+  cudaFree(d_u_prev);
+
+  // RCLCPP_INFO(node_->get_logger(), "epsilon[0,0,0]=%f, epsilon[0,0,1]=%f", epsilon_(0,0,0), epsilon_(0,0,1));
+  // for ( size_t k = 0; k < opts_.samples_K; ++k ) {
+  //   RCLCPP_INFO(node_->get_logger(), "c%d:%.2f", k, costs_[k]);
+  // }
 }
 
 float MPPIController::calc_obstacle_cost( const Vec3f & state ){
@@ -268,6 +666,10 @@ float MPPIController::calc_obstacle_cost( const Vec3f & state ){
     // 一般避障惩罚 (膨胀半径内)
     penalty += opts_.obstacle_cost_weight * (max_penalty_dist - dist_to_obstacle);
   }
+
+  // if ( cost != 0 ) {
+  //   RCLCPP_INFO(node_->get_logger(), "%u, %.2f, %.2f", cost, dist_to_obstacle, penalty);
+  // }
   
   return penalty;
 }
@@ -286,21 +688,21 @@ float MPPIController::calc_input_cost( const Vec2f & u, const size_t & t ){
   return total_cost;
 }
 
-float MPPIController::calc_stage_cost(const Vec3f &state, const float & u_v_t, const size_t &t) {
+float MPPIController::calc_stage_cost(const Vec3f &state, const size_t &t) {
   Vec2f search_pt(state[0], state[1]);
   size_t proj_idx = get_projected_waypoint(search_pt);
 
   // 根据当前速度预测前向弧长距离（也可以使用固定值）
-  float forward_dist = std::abs(u_v_t) * opts_.dt * t;
+  float forward_dist = std::max(0.5f, std::abs(u_prev_(0,0)) * opts_.dt * t);
   float target_arc = path_arc_lengths_(proj_idx) + forward_dist;
 
-  // 手动实现二分查找：找到第一个弧长 >= target_arc 的索引
-  size_t low = prev_waypoints_idx_;
+  // 手动实现二分查找：找到第一个弧长 >= target_arc 的索引 Olog(n)
+  size_t low = 0;
   size_t high = path_points_size_ - 1;
   size_t target_idx = high;  // 默认最后一个（若所有弧长都小于 target_arc）
 
   while (low <= high) {
-    size_t mid = ( low + high ) / 2;
+    size_t mid = low + (high - low) / 2;
     if (path_arc_lengths_(mid) >= target_arc) {
       target_idx = mid;
       if (mid == 0) break;   // 已经是第一个，无需继续
@@ -310,6 +712,7 @@ float MPPIController::calc_stage_cost(const Vec3f &state, const float & u_v_t, c
     }
   }
 
+  
   // 获取参考点坐标和朝向
   float ref_x = path_points_(target_idx, 0);
   float ref_y = path_points_(target_idx, 1);
@@ -318,36 +721,31 @@ float MPPIController::calc_stage_cost(const Vec3f &state, const float & u_v_t, c
   float dx = ref_x - state[0];
   float dy = ref_y - state[1];
   float dyaw = ref_yaw - state[2];
-  if (dyaw < -M_PI) dyaw += 2.0 * M_PI;
-  if (dyaw >  M_PI) dyaw -= 2.0 * M_PI;
+  // if (dyaw < -M_PI) dyaw += M_2PI_;
+  // if (dyaw >  M_PI) dyaw -= M_2PI_;
+  if (dyaw < -M_PI_2) dyaw += M_PI;
+  if (dyaw >  M_PI_2) dyaw -= M_PI;
   
   return opts_.stage_cost_weight[0] * dx*dx +
           opts_.stage_cost_weight[1] * dy*dy +
           opts_.stage_cost_weight[2] * dyaw*dyaw;
 }
 
-float MPPIController::calc_terminal_cost( const Vec3f & state, const size_t & k ) {
+float MPPIController::calc_terminal_cost( const Vec3f & state ) {
   Vec2f search_pt(state[0], state[1]);
   size_t proj_idx = get_projected_waypoint(search_pt);
-  size_t idx = opts_.step_T - 1;
-  float u_v_T = u_prev_(idx,0) + epsilon_(k, idx, 0);
-  float forward_dist = std::abs( u_v_T ) * opts_.step_T * opts_.dt;
+  float forward_dist = std::abs(u_prev_(0,0)) * opts_.step_T * opts_.dt;
   float target_arc = path_arc_lengths_(proj_idx) + forward_dist;
 
-  size_t low = prev_waypoints_idx_;
-  size_t high = path_points_size_ - 1;
-  size_t target_idx = high;  // 默认最后一个（若所有弧长都小于 target_arc）
-
-  while (low <= high) {
-    size_t mid = ( low + high ) / 2;
-    if (path_arc_lengths_(mid) >= target_arc) {
-      target_idx = mid;
-      if (mid == 0) break;   // 已经是第一个，无需继续
-      high = mid - 1;        // 继续向左寻找更小的满足条件的索引
-    } else {
-      low = mid + 1;         // 向右搜索
+  // 找到目标弧长对应的路径点索引
+  size_t target_idx = proj_idx;
+  for (size_t i = proj_idx; i < path_points_size_; ++i) {
+    if (path_arc_lengths_(i) >= target_arc) {
+        target_idx = i;
+        break;
     }
   }
+  target_idx = std::min(target_idx, path_points_size_ - 1);
   
   // 获取参考点坐标和朝向
   float ref_x = path_points_(target_idx, 0);
@@ -357,12 +755,16 @@ float MPPIController::calc_terminal_cost( const Vec3f & state, const size_t & k 
   float dx = ref_x - state[0];
   float dy = ref_y - state[1];
   float dyaw = ref_yaw - state[2];
-  if (dyaw < -M_PI) dyaw += 2.0 * M_PI;
-  if (dyaw >  M_PI) dyaw -= 2.0 * M_PI;
+  // if (dyaw < -M_PI) dyaw += M_2PI_;
+  // if (dyaw >  M_PI) dyaw -= M_2PI_;
+  // 限制到-PI/2到-PI/2区间内可以倒着跑
+  if (dyaw < -M_PI_2) dyaw += M_PI;
+  if (dyaw >  M_PI_2) dyaw -= M_PI;
 
   float terminal_cost =  opts_.terminal_cost_weight[0] * dx * dx + 
                           opts_.terminal_cost_weight[1] * dy * dy + 
                           opts_.terminal_cost_weight[2] * dyaw * dyaw;
+  RCLCPP_INFO(node_->get_logger(), "terminal cost: %.2f, dyaw:%.2f", terminal_cost, dyaw);
   return terminal_cost;
 }
 
@@ -416,6 +818,7 @@ void MPPIController::calc_control_seq(){
       limit_input(u);
       u_prev_(t, 0) = u(0);
       u_prev_(t, 1) = u(1);
+      
     });
 }
 
@@ -427,8 +830,8 @@ void MPPIController::calc_control_seq(){
  */
 Vec3f MPPIController::calc_next_state( const Vec3f & state, const Vec2f & input ){
   Vec3f next_state;
-  next_state[0] = state[0] + input[0] * cosf(state[2]) * opts_.dt;
-  next_state[1] = state[1] + input[0] * sinf(state[2]) * opts_.dt;
+  next_state[0] = state[0] + input[0] * std::cos(state[2]) * opts_.dt;
+  next_state[1] = state[1] + input[0] * std::sin(state[2]) * opts_.dt;
   next_state[2] = state[2] + input[1] * opts_.dt;
   return next_state;
 }
@@ -447,7 +850,6 @@ size_t MPPIController::get_projected_waypoint(const Vec2f &pt) {
   // 基于 prev_waypoints_idx_ 或上一次的投影点，在局部窗口内搜索（前后各10个点）。
   const size_t num = 10;
   size_t start = (prev_waypoints_idx_ > num) ? prev_waypoints_idx_ - num : 0;
-  // size_t start = (prev_waypoints_idx_ > num) ? prev_waypoints_idx_ - num : prev_waypoints_idx_; // TODO
   size_t end = std::min(prev_waypoints_idx_ + num, path_points_size_ - 1);
   for (size_t i = start; i <= end; ++i) {
       float dx = path_points_(i,0) - pt(0);
@@ -459,6 +861,9 @@ size_t MPPIController::get_projected_waypoint(const Vec2f &pt) {
       }
   }
   
+  if (best_idx >= path_points_size_) {
+    best_idx = path_points_size_ - 1;
+  }
   // 确保投影点不会小于上一个参考点（避免倒退）
   if (best_idx < prev_waypoints_idx_) {
       best_idx = prev_waypoints_idx_;
@@ -497,7 +902,7 @@ size_t MPPIController::get_nearest_waypoint( Vec2f & pt, bool update_prev_idx ) 
 void MPPIController::smooth_control_seq(){
   // 一定一定一定要滑动滤波一下，这东西突变非常大, 角速度能从-0.4调到正数
   // 三点均值平滑（注意边界）
-  Eigen::Tensor<float, 2> u_smooth(opts_.step_T, opts_.dim_u);
+  Eigen::Tensor<float, 2, Eigen::RowMajor> u_smooth(opts_.step_T, opts_.dim_u);
   u_smooth.setZero();
   u_smooth(0, 0) = u_prev_(0, 0);
   u_smooth(0, 1) = u_prev_(0, 1);
@@ -633,13 +1038,13 @@ void MPPIController::update_parameters(){
   node_->get_parameter(plugin_name_ + ".inflation_radius", opts_.inflation_radius);
   node_->get_parameter(plugin_name_ + ".cost_scaling_factor", opts_.cost_scaling_factor);
 
-  u_prev_ = Eigen::Tensor<float, 2>(opts_.step_T, opts_.dim_u);
+  u_prev_ = Eigen::Tensor<float, 2, Eigen::RowMajor>(opts_.step_T, opts_.dim_u);
   u_prev_.setZero();
 
-  epsilon_ = Eigen::Tensor<float, 3>(opts_.samples_K, opts_.step_T, opts_.dim_u);
+  epsilon_ = Eigen::Tensor<float, 3, Eigen::RowMajor>(opts_.samples_K, opts_.step_T, opts_.dim_u);
   epsilon_.setZero();
   
-  w_epsilon_ = Eigen::Tensor<float, 2>(opts_.step_T, opts_.dim_u);
+  w_epsilon_ = Eigen::Tensor<float, 2, Eigen::RowMajor>(opts_.step_T, opts_.dim_u);
   w_epsilon_.setZero();
 
   costs_ = Eigen::ArrayXf(opts_.samples_K);
@@ -658,8 +1063,9 @@ void MPPIController::update_parameters(){
     index_T_[t] = t;
   }
 
-  RCLCPP_INFO(node_->get_logger(), "更新参数：frequency=%.2f, max_v=%.2f, max_w=%.2f, step_T=%zu, samples_K=%zu, lambda=%.2f, sigma_v=%.4f, sigma_w=%.4f",
-    frequency, opts_.max_v, opts_.max_w, opts_.step_T, opts_.samples_K, opts_.lambda, sigma_v, sigma_w);
+  freeDeviceMemory();
+  // 分配 CUDA 内存
+  allocateDeviceMemory();
 }
 
 } // namespace rm_mppi_controller
