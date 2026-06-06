@@ -1,5 +1,4 @@
 #include "rm_mppi_controller/mppi_controller.hpp"
-#include "rm_mppi_controller/utils.h"
 #include "nav2_core/exceptions.hpp"
 #include "nav2_util/geometry_utils.hpp"
 #include "nav2_util/node_utils.hpp"
@@ -9,11 +8,17 @@
 #include <memory>
 #include <string>
 #include <thread>
-#include <random>
 #include <execution>
 #include <cmath>
+#include <glog/logging.h>
 
 namespace rm_mppi_controller {
+
+MPPIController::~MPPIController(){
+  if ( has_init_cl_ ) {
+    releaseOpenCL();
+  }
+}
 
 void MPPIController::configure(
     const rclcpp_lifecycle::LifecycleNode::WeakPtr &parent, std::string name,
@@ -41,10 +46,17 @@ void MPPIController::activate() {
 
   // update 参数
   update_parameters();
-  RCLCPP_INFO(node_->get_logger(),"update MPPI 完成!!!!!!!!!!");
+
+  // OpenCL 相关变量
+  initOpenCL();
+
+  RCLCPP_INFO(node_->get_logger(),"update MPPI 控制器完成!!!!!!!!!!");
 }
 
-void MPPIController::deactivate() { RCLCPP_INFO(node_->get_logger(), "停用控制器：%s 类型为 rm_mppi_controller::MPPIController", plugin_name_.c_str());}
+void MPPIController::deactivate() {
+  releaseOpenCL();
+  RCLCPP_INFO(node_->get_logger(), "停用控制器：%s 类型为 rm_mppi_controller::MPPIController", plugin_name_.c_str());
+}
 
 geometry_msgs::msg::TwistStamped MPPIController::computeVelocityCommands(
     const geometry_msgs::msg::PoseStamped &pose,
@@ -55,7 +67,7 @@ geometry_msgs::msg::TwistStamped MPPIController::computeVelocityCommands(
 
   // 在 odom 系下计算，因为costmap的系就是odom，这样方便访问代价地图
 
-  std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
+  // std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
 
   if ( path_points_size_ < 10 ) {
     // 清除控制量
@@ -71,15 +83,27 @@ geometry_msgs::msg::TwistStamped MPPIController::computeVelocityCommands(
   Vec3f x0( pose.pose.position.x, pose.pose.position.y,
     tf2::getYaw(pose.pose.orientation));
 
+  float delta_t = (x0.head<2>() - goal_pt_.head<2>()).norm();
+  if ( delta_t < opts_.near_goal_distance ) {
+    opts_.use_obstacle_cost = false;
+  } else {
+    opts_.use_obstacle_cost = true;
+  }
+
   // 寻找离当前车辆位置最近的参考路径点，并更新索引
   Vec2f search_pt = Vec2f( x0.x(), x0.y() );
-  get_nearest_waypoint( search_pt, true );
+  find_nearest_waypoint( search_pt );
   if ( prev_waypoints_idx_ >= path_points_size_ ) {
     throw nav2_core::PlannerException("无法找到有效的路径点");
   }
 
   // loop for 0 ~ K-1 samples  耗时较长  TODO
+  std::chrono::steady_clock::time_point t1 = std::chrono::steady_clock::now();
   calc_total_costs(x0);
+  std::chrono::steady_clock::time_point t2 = std::chrono::steady_clock::now();
+  auto time_used = std::chrono::duration_cast<std::chrono::duration<double>>(t2 - t1);
+  RCLCPP_INFO( node_->get_logger(), "[calc_total_costs]:%.5fs", time_used.count() );
+  
 
   // 计算每个采样轨迹的权重（基于成本） weights_
   calc_weights();
@@ -103,9 +127,9 @@ geometry_msgs::msg::TwistStamped MPPIController::computeVelocityCommands(
   
   // 控制序列移位（滚动时域热启动）
   shift_control_seq();
-  std::chrono::steady_clock::time_point t2 = std::chrono::steady_clock::now();
-  auto time_used = std::chrono::duration_cast<std::chrono::duration<double>>(t2 - t1);
-  RCLCPP_INFO( node_->get_logger(), "[computeVelocityCommands]:%.5fs", time_used.count() );
+  // std::chrono::steady_clock::time_point t2 = std::chrono::steady_clock::now();
+  // auto time_used = std::chrono::duration_cast<std::chrono::duration<double>>(t2 - t1);
+  // RCLCPP_INFO( node_->get_logger(), "[computeVelocityCommands]:%.5fs", time_used.count() );
   
   return cmd_vel;
 }
@@ -118,9 +142,17 @@ void MPPIController::setPlan(const nav_msgs::msg::Path &path) {
   // 预计算弧长和路径点
   if (global_plan_.poses.empty()) return;
 
+  // 目标点
+  auto temp_pose = global_plan_.poses.back().pose;
+  float goal_x = temp_pose.position.x;
+  float goal_y = temp_pose.position.y;
+  float goal_yaw = 2 * std::atan2(temp_pose.orientation.z, temp_pose.orientation.w); // 2d yaw = 2 * atan2(z, w)
+  goal_pt_ = Vec3f(goal_x, goal_y, goal_yaw);
+
   path_points_size_ = global_plan_.poses.size();
-  path_arc_lengths_ = Eigen::Tensor<float, 2>(path_points_size_, 1); // 累积弧长数组
-  path_points_      = Eigen::Tensor<float, 2>(path_points_size_, 3);  // x, y, yaw
+  
+  path_arc_lengths_ = Eigen::Tensor<float, 2, Eigen::RowMajor>(path_points_size_, 1); // 累积弧长数组
+  path_points_      = Eigen::Tensor<float, 2, Eigen::RowMajor>(path_points_size_, 3);  // x, y, yaw
   float cum_len = 0.0;
   path_arc_lengths_(0) = cum_len;
 
@@ -152,9 +184,12 @@ void MPPIController::setPlan(const nav_msgs::msg::Path &path) {
     path_points_(i, 0) = x1;   path_points_(i, 1) = y1;   path_points_(i, 2) = yaw1;
     x0 = x1;                   y0 = y1;
   }
+
+  /// OpenCL
+  copyPathToDevice();
   
-  RCLCPP_INFO(node_->get_logger(), "Path arc length: %.2f m", cum_len);
-  RCLCPP_INFO(node_->get_logger(), "new global plan size: %zu", path_points_size_);
+  // RCLCPP_INFO(node_->get_logger(), "Path arc length: %.2f m", cum_len);
+  // RCLCPP_INFO(node_->get_logger(), "new global plan size: %zu", path_points_size_);
 }
 
 void MPPIController::setSpeedLimit(const double &speed_limit,
@@ -164,206 +199,68 @@ void MPPIController::setSpeedLimit(const double &speed_limit,
 }
 
 void MPPIController::calc_total_costs( const Vec3f &start_state ){
-  Vec3f x0 = start_state;
-  // 对每个采样轨迹进行前向仿真，计算成本
-  // 并发计算总代价
-  unsigned int global_seed = node_->get_clock()->now().nanoseconds();
-  std::for_each(std::execution::par_unseq, index_K_.begin(), index_K_.end(),
-    [&](const size_t & k){
-      Vec3f x = x0;
-      Eigen::ArrayXf temp_stage_cost(opts_.step_T);
-      unsigned int seed = global_seed + k * 1664525u;
-      // std::execution::par 允许算法在多个线程上并行处理数据，但‌不保证一定加速‌。
-      std::for_each(std::execution::par, index_T_.begin(), index_T_.end(),
-        [&](const size_t & t) {
-          /// 采样噪声
-          unsigned int step_seed = seed + t * 104729u;
-          epsilon_(k, t, 0) = rand_gaussian(&step_seed) * opts_.std_v;
-          epsilon_(k, t, 1) = rand_gaussian(&step_seed) * opts_.std_w;
 
-          // 生成带有噪声的控制输入, 在上一最优控制输入上叠加噪声
-          Vec2f u = Vec2f::Zero();
-          float u_v = u_prev_(t, 0) + epsilon_(k, t, 0);
-          float u_w = u_prev_(t, 1) + epsilon_(k, t, 1);
-          u = Vec2f(u_v, u_w);
+  /// OpenCL
+  copyCostmapToDevice();
 
-          limit_input(u);
-          x = calc_next_state( x, u );
+  updateMPPIParams( start_state );
 
-          // 累加阶段成本，并加上控制输入成本项
-          temp_stage_cost[t] = calc_stage_cost( x, u_v, t );
-          temp_stage_cost[t] += calc_input_cost( u, t );
-          temp_stage_cost[t] += calc_obstacle_cost( x );
-      });
+  // cl_u_prev_
+  clEnqueueWriteBuffer( cl_queue_, cl_u_prev_, CL_TRUE, 0, sizeof(float) * opts_.step_T * opts_.dim_u, u_prev_.data(), 0, nullptr, nullptr );
 
-      // 并发完后累加
-      costs_[k] = temp_stage_cost.sum();
+  // 设置内核参数
+  cl_ret_ = clSetKernelArg( cl_kernel_, 0, sizeof(cl_mem), &cl_u_prev_ );
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clSetKernelArg [cl_u_prev_] faild!" << cl_ret_;
+  cl_ret_ = clSetKernelArg( cl_kernel_, 1, sizeof(cl_mem), &cl_costs_ );
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clSetKernelArg [cl_costs_] faild! " << cl_ret_;
+  cl_ret_ = clSetKernelArg( cl_kernel_, 2, sizeof(cl_mem), &cl_epsilon_ );
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clSetKernelArg [cl_epsilon_] faild! " << cl_ret_;
+  cl_ret_ = clSetKernelArg( cl_kernel_, 3, sizeof(cl_mem), &cl_path_points_ );
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clSetKernelArg [cl_path_points_] faild! " << cl_ret_;
+  cl_ret_ = clSetKernelArg( cl_kernel_, 4, sizeof(cl_mem), &cl_arc_lengths_ );
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clSetKernelArg [cl_arc_lengths_] faild! " << cl_ret_;
+  cl_ret_ = clSetKernelArg( cl_kernel_, 5, sizeof(cl_mem), &cl_costmap_ );
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clSetKernelArg [cl_costmap_] faild! " << cl_ret_;
+  cl_ret_ = clSetKernelArg( cl_kernel_, 6, sizeof(cl_mem), &cl_mps_buf_ );
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clSetKernelArg [cl_mps_] faild! " << cl_ret_;
+  uint global_seed = node_->get_clock()->now().nanoseconds();
+  cl_ret_ = clSetKernelArg( cl_kernel_, 7, sizeof(uint), &global_seed );
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clSetKernelArg [global_seed] faild! " << cl_ret_;
 
-      // 添加终端成本
-      costs_[k] += calc_terminal_cost( x, k );
-    });
-}
+  // 执行内核的核心函数, 调用是非阻塞，函数立即返回，内核在设备端异步运行。
+  // command_queue	命令队列，内核将在此队列上执行
+  // kernel	要执行的内核对象（由 clCreateKernel 创建）
+  // work_dim	工作空间维度，1、2 或 3
+  // global_work_offset	全局偏移量，通常设为 NULL（表示从 0 开始）
+  // global_work_size	每个维度的工作项总数（如 {1024} 表示 1024 个线程）
+  // local_work_size	每个工作组的工作项数，可为 NULL（由实现自动选择）
+  // num_events_in_wait_list	等待事件数量，通常为 0
+  // event_wait_list	等待的事件列表，通常为 NULL
+  // event	返回的事件对象，用于同步，不需要时可为 NULL
+  size_t global_size = opts_.samples_K;  // 线程数
+  cl_ret_ = clEnqueueNDRangeKernel( cl_queue_, cl_kernel_, 1, nullptr, &global_size, nullptr, 0, nullptr, nullptr );
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clEnqueueNDRangeKernel faild! " << cl_ret_;
 
-float MPPIController::calc_obstacle_cost( const Vec3f & state ){
-  // 在此处读的是local_map，不是global_map，local_map的更新频率要高
-  float x = state(0);
-  float y = state(1);
+  // 等待执行
+  clFinish( cl_queue_ );
 
-  unsigned int mx, my;
-  // 1. 检查点是否在地图内
-  if (!costmap_->worldToMap(x, y, mx, my)) {
-    return 0.0f; // 超出地图边界，假设无障碍
-  }
-
-  unsigned char cost = costmap_->getCost(mx, my);
-
-  // 自由空间直接返回 0 代价
-  // 否则可能导致 log(0) = -inf 进而 Velocity message contains NaNs or Infs! Ignoring as invalid!
-  // 1. 自由空间（包括 cost 0 和 1? 通常 FREE_SPACE = 0）
-  if (cost <= nav2_costmap_2d::FREE_SPACE) {  // FREE_SPACE 通常是 0
-    return 0.0f;
-  }
-  
-  // 2. 未知区域（可选处理）
-  if (cost == nav2_costmap_2d::NO_INFORMATION) {
-    return 0.0f;  // 或返回一个小惩罚，但不要返回 inf
-  }
-  
-  // 3. 致命障碍物
-  if (cost >= nav2_costmap_2d::LETHAL_OBSTACLE) {
-    return opts_.collision_cost;
-  }
-
-  // 4. 此时 cost 范围应为 1~253
-  // 如果没有膨胀层参数，则使用原始代价比例
-  if (opts_.inflation_radius <= 0.0f || opts_.cost_scaling_factor <= 0.0f) {
-    if (cost <= nav2_costmap_2d::FREE_SPACE) {
-      return 0.0f;
-    }
-    // 将代价值 (0-254) 线性缩放到 [0,1] 区间
-    return opts_.obstacle_cost_weight * (static_cast<float>(cost) / 254.0f);
-  }
-
-  // 5. 有膨胀层参数，计算到障碍物的真实距离
-  // 膨胀层代价模型: cost = 254 * exp(-scale_factor * (dist - inscribed_radius))
-  const float min_radius = costmap_ros_->getLayeredCostmap()->getInscribedRadius();
-  const float scale_factor = opts_.cost_scaling_factor;
-  
-  // 解算距离公式: dist = (log(254) - log(cost)) / scale_factor + inscribed_radius
-  // float cost_f = std::max(static_cast<float>(cost), 1.0f);
-  float dist_to_obstacle = (std::log(254.0f) - std::log(static_cast<float>(cost))) / scale_factor + min_radius;
-
-  // 如果代价小于最小内接圆半径内的代价，直接使用最小半径距离
-  if (dist_to_obstacle < min_radius) {
-    dist_to_obstacle = min_radius;
-  }
-
-  // 5. 计算惩罚项
-  float penalty = 0.0f;
-  const float max_penalty_dist = opts_.inflation_radius;
-  if (dist_to_obstacle <= opts_.collision_margin_distance) {
-    // 严重惩罚 (安全边距内)
-    penalty += opts_.critical_weight * (opts_.collision_margin_distance - dist_to_obstacle);
-  } else if (dist_to_obstacle < max_penalty_dist) {
-    // 一般避障惩罚 (膨胀半径内)
-    penalty += opts_.obstacle_cost_weight * (max_penalty_dist - dist_to_obstacle);
-  }
-  
-  return penalty;
-}
-
-float MPPIController::calc_input_cost( const Vec2f & u, const size_t & t ){
-  // u.transpose() * opts_.sigma.inverse() * u;
-  float du_v = u.x() - u_prev_(t, 0);
-  float du_w = u.y() - u_prev_(t, 1);
-  float du_cost = 
-      opts_.gamma_dv * du_v * du_v / opts_.sigma(0,0) + 
-      opts_.gamma_dw * du_w * du_w / opts_.sigma(1,1);
-  float u_cost  = 
-      opts_.gamma_v  * u.x()*u.x() / opts_.sigma(0,0) + 
-      opts_.gamma_w  * u.y()*u.y() / opts_.sigma(1,1);
-  float total_cost = du_cost + u_cost;
-  return total_cost;
-}
-
-float MPPIController::calc_stage_cost(const Vec3f &state, const float & u_v_t, const size_t &t) {
-  Vec2f search_pt(state[0], state[1]);
-  size_t proj_idx = get_projected_waypoint(search_pt);
-
-  // 根据当前速度预测前向弧长距离（也可以使用固定值）
-  float forward_dist = std::abs(u_v_t) * opts_.dt * t;
-  float target_arc = path_arc_lengths_(proj_idx) + forward_dist;
-
-  // 手动实现二分查找：找到第一个弧长 >= target_arc 的索引
-  size_t low = prev_waypoints_idx_;
-  size_t high = path_points_size_ - 1;
-  size_t target_idx = high;  // 默认最后一个（若所有弧长都小于 target_arc）
-
-  while (low <= high) {
-    size_t mid = ( low + high ) / 2;
-    if (path_arc_lengths_(mid) >= target_arc) {
-      target_idx = mid;
-      if (mid == 0) break;   // 已经是第一个，无需继续
-      high = mid - 1;        // 继续向左寻找更小的满足条件的索引
-    } else {
-      low = mid + 1;         // 向右搜索
-    }
-  }
-
-  // 获取参考点坐标和朝向
-  float ref_x = path_points_(target_idx, 0);
-  float ref_y = path_points_(target_idx, 1);
-  float ref_yaw = path_points_(target_idx, 2);
-  
-  float dx = ref_x - state[0];
-  float dy = ref_y - state[1];
-  float dyaw = ref_yaw - state[2];
-  if (dyaw < -M_PI) dyaw += 2.0 * M_PI;
-  if (dyaw >  M_PI) dyaw -= 2.0 * M_PI;
-  
-  return opts_.stage_cost_weight[0] * dx*dx +
-          opts_.stage_cost_weight[1] * dy*dy +
-          opts_.stage_cost_weight[2] * dyaw*dyaw;
-}
-
-float MPPIController::calc_terminal_cost( const Vec3f & state, const size_t & k ) {
-  Vec2f search_pt(state[0], state[1]);
-  size_t proj_idx = get_projected_waypoint(search_pt);
-  size_t idx = opts_.step_T - 1;
-  float u_v_T = u_prev_(idx,0) + epsilon_(k, idx, 0);
-  float forward_dist = std::abs( u_v_T ) * opts_.step_T * opts_.dt;
-  float target_arc = path_arc_lengths_(proj_idx) + forward_dist;
-
-  size_t low = prev_waypoints_idx_;
-  size_t high = path_points_size_ - 1;
-  size_t target_idx = high;  // 默认最后一个（若所有弧长都小于 target_arc）
-
-  while (low <= high) {
-    size_t mid = ( low + high ) / 2;
-    if (path_arc_lengths_(mid) >= target_arc) {
-      target_idx = mid;
-      if (mid == 0) break;   // 已经是第一个，无需继续
-      high = mid - 1;        // 继续向左寻找更小的满足条件的索引
-    } else {
-      low = mid + 1;         // 向右搜索
-    }
-  }
-  
-  // 获取参考点坐标和朝向
-  float ref_x = path_points_(target_idx, 0);
-  float ref_y = path_points_(target_idx, 1);
-  float ref_yaw = path_points_(target_idx, 2);
-  
-  float dx = ref_x - state[0];
-  float dy = ref_y - state[1];
-  float dyaw = ref_yaw - state[2];
-  if (dyaw < -M_PI) dyaw += 2.0 * M_PI;
-  if (dyaw >  M_PI) dyaw -= 2.0 * M_PI;
-
-  float terminal_cost =  opts_.terminal_cost_weight[0] * dx * dx + 
-                          opts_.terminal_cost_weight[1] * dy * dy + 
-                          opts_.terminal_cost_weight[2] * dyaw * dyaw;
-  return terminal_cost;
+  // 读取结果
+  // queue,          // 命令队列
+  // d_buffer,       // 设备端缓冲区对象
+  // CL_TRUE,        // 阻塞标志（BLOCKING）
+  // 0,              // 偏移量（字节）
+  // size_bytes,     // 要读取的字节数
+  // host_ptr,       // 主机端内存指针（必须已分配空间）
+  // 0,              // 等待事件数量
+  // NULL,           // 等待事件列表
+  // NULL            // 返回的事件对象（不需要可为 NULL）
+  cl_ret_ = clEnqueueReadBuffer( cl_queue_, 
+    cl_costs_, CL_TRUE, 0,  opts_.samples_K * sizeof(float), costs_.data(), 0, nullptr, nullptr );
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clEnqueueReadBuffer costs_ failed! " << cl_ret_;
+  cl_ret_ = clEnqueueReadBuffer( cl_queue_, 
+    cl_epsilon_, CL_TRUE, 0, opts_.samples_K * opts_.step_T * opts_.dim_u * sizeof(float), epsilon_.data(), 0, nullptr, nullptr );
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clEnqueueReadBuffer epsilon_ failed! " << cl_ret_;
+  // LOG(INFO) << costs_[0] << ", " << epsilon_(0,0,0) << ", " << epsilon_(0,0,1);
 }
 
 void MPPIController::calc_weights() {
@@ -438,35 +335,7 @@ void MPPIController::limit_input( Vec2f & input ) {
   input[1] = std::clamp(input[1], -opts_.max_w, opts_.max_w);
 }
 
-size_t MPPIController::get_projected_waypoint(const Vec2f &pt) {
-  // 在局部窗口内找到真正的投影点（基于弧长）
-  // 方法：找到路径上与 pt 最近的两个点，然后根据投影比例插值弧长
-  size_t best_idx = 0;
-  float best_dist = std::numeric_limits<float>::max();
-  
-  // 基于 prev_waypoints_idx_ 或上一次的投影点，在局部窗口内搜索（前后各10个点）。
-  const size_t num = 10;
-  size_t start = (prev_waypoints_idx_ > num) ? prev_waypoints_idx_ - num : 0;
-  // size_t start = (prev_waypoints_idx_ > num) ? prev_waypoints_idx_ - num : prev_waypoints_idx_; // TODO
-  size_t end = std::min(prev_waypoints_idx_ + num, path_points_size_ - 1);
-  for (size_t i = start; i <= end; ++i) {
-      float dx = path_points_(i,0) - pt(0);
-      float dy = path_points_(i,1) - pt(1);
-      float dist = dx*dx + dy*dy;
-      if (dist < best_dist) {
-          best_dist = dist;
-          best_idx = i;
-      }
-  }
-  
-  // 确保投影点不会小于上一个参考点（避免倒退）
-  if (best_idx < prev_waypoints_idx_) {
-      best_idx = prev_waypoints_idx_;
-  }
-  return best_idx;
-}
-
-size_t MPPIController::get_nearest_waypoint( Vec2f & pt, bool update_prev_idx ) {
+size_t MPPIController::find_nearest_waypoint( Vec2f & pt ) {
   // 搜索起点：上一个最近点（不允许回到更早的点）
   size_t start_idx = prev_waypoints_idx_;
   if (start_idx >= path_points_size_) start_idx = 0;
@@ -488,16 +357,14 @@ size_t MPPIController::get_nearest_waypoint( Vec2f & pt, bool update_prev_idx ) 
       }
   }
   
-  if (update_prev_idx) {
-    prev_waypoints_idx_ = best_idx;
-  }
+  prev_waypoints_idx_ = best_idx;
   return best_idx;
 }
 
 void MPPIController::smooth_control_seq(){
   // 一定一定一定要滑动滤波一下，这东西突变非常大, 角速度能从-0.4调到正数
   // 三点均值平滑（注意边界）
-  Eigen::Tensor<float, 2> u_smooth(opts_.step_T, opts_.dim_u);
+  Eigen::Tensor<float, 2, Eigen::RowMajor> u_smooth(opts_.step_T, opts_.dim_u);
   u_smooth.setZero();
   u_smooth(0, 0) = u_prev_(0, 0);
   u_smooth(0, 1) = u_prev_(0, 1);
@@ -597,6 +464,9 @@ void MPPIController::update_parameters(){
   nav2_util::declare_parameter_if_not_declared(node_, plugin_name_ + ".near_goal_distance", rclcpp::ParameterValue(0.5));        // 接近目标距离，此距离内停用一般避障项
   nav2_util::declare_parameter_if_not_declared(node_, plugin_name_ + ".inflation_radius", rclcpp::ParameterValue(0.55));         // 代价地图的膨胀半径
   nav2_util::declare_parameter_if_not_declared(node_, plugin_name_ + ".cost_scaling_factor", rclcpp::ParameterValue(3.0));       // 代价衰减系数：越大衰减越快（更敢贴边
+  nav2_util::declare_parameter_if_not_declared(node_, plugin_name_ + ".kernel_file", rclcpp::ParameterValue("/home/lrj/RM/test/MPPI_test/MPPI_opencl/rm_mppi_controller/kernel/kernel_func.cl"));
+  nav2_util::declare_parameter_if_not_declared(node_, plugin_name_ + ".kernel_name", rclcpp::ParameterValue("calc_total_cost"));
+  nav2_util::declare_parameter_if_not_declared(node_, plugin_name_ + ".mppi_params_dir", rclcpp::ParameterValue("/home/lrj/RM/test/MPPI_test/MPPI_opencl/rm_mppi_controller/include/rm_mppi_controller"));
 
   node_->get_parameter(plugin_name_ + ".frequency", frequency);
   opts_.dt = 1.0 / frequency;
@@ -617,8 +487,8 @@ void MPPIController::update_parameters(){
   node_->get_parameter(plugin_name_ + ".sigma_v", sigma_v);
   node_->get_parameter(plugin_name_ + ".sigma_w", sigma_w);
   opts_.sigma.diagonal() << sigma_v, sigma_w;
-  opts_.std_v = std::sqrt(opts_.sigma(0,0));
-  opts_.std_w = std::sqrt(opts_.sigma(1,1));
+  opts_.std_v = sqrtf(opts_.sigma(0,0));
+  opts_.std_w = sqrtf(opts_.sigma(1,1));
   node_->get_parameter(plugin_name_ + ".stage_cost_weight_x", opts_.stage_cost_weight.x());
   node_->get_parameter(plugin_name_ + ".stage_cost_weight_y", opts_.stage_cost_weight.y());
   node_->get_parameter(plugin_name_ + ".stage_cost_weight_yaw", opts_.stage_cost_weight.z());
@@ -632,14 +502,49 @@ void MPPIController::update_parameters(){
   node_->get_parameter(plugin_name_ + ".near_goal_distance", opts_.near_goal_distance);
   node_->get_parameter(plugin_name_ + ".inflation_radius", opts_.inflation_radius);
   node_->get_parameter(plugin_name_ + ".cost_scaling_factor", opts_.cost_scaling_factor);
+  node_->get_parameter(plugin_name_ + ".kernel_file", cl_kernel_file_);
+  node_->get_parameter(plugin_name_ + ".kernel_name", cl_kernel_name_);
+  node_->get_parameter(plugin_name_ + ".mppi_params_dir", cl_mppi_params_dir_);
 
-  u_prev_ = Eigen::Tensor<float, 2>(opts_.step_T, opts_.dim_u);
+  LOG(INFO) << "cl_kernel_file_: " << cl_kernel_file_;
+  LOG(INFO) << "cl_kernel_name_: " << cl_kernel_name_;
+  LOG(INFO) << "cl_mppi_params_dir_: " << cl_mppi_params_dir_;
+
+  cl_mps_.dim_x                     = opts_.dim_x;       // 系统状态向量维度
+  cl_mps_.dim_u                     = opts_.dim_u;       // 控制输入向量维度
+  cl_mps_.dt                        = opts_.dt;          // 离散时间步长
+  cl_mps_.max_v                     = opts_.max_v;       // max velocity
+  cl_mps_.max_w                     = opts_.max_w;       // max omega
+  cl_mps_.step_T                    = opts_.step_T;      // 预测时域长度
+  cl_mps_.samples_K                 = opts_.samples_K;   // 采样轨迹数量
+  cl_mps_.lambda                    = opts_.lambda;      // MPPI的温度参数，影响权重分布
+  cl_mps_.gamma_dv                  = opts_.gamma_dv;    // cost of velocity input
+  cl_mps_.gamma_dw                  = opts_.gamma_dw;    // cost of omega input
+  cl_mps_.gamma_v                   = opts_.gamma_v;     // cost of velocity input
+  cl_mps_.gamma_w                   = opts_.gamma_w;     // cost of omega input
+  cl_mps_.sigma_v                   = opts_.sigma(0,0);  // 噪声协方差矩阵
+  cl_mps_.sigma_w                   = opts_.sigma(1,1);  // 噪声协方差矩阵
+  cl_mps_.std_v                     = opts_.std_v;
+  cl_mps_.std_w                     = opts_.std_w;
+  cl_mps_.stage_cost_weight_x       = opts_.stage_cost_weight(0);     // 阶段成本权重  x
+  cl_mps_.stage_cost_weight_y       = opts_.stage_cost_weight(1);     // 阶段成本权重  y
+  cl_mps_.stage_cost_weight_yaw     = opts_.stage_cost_weight(2);     // 阶段成本权重  yaw
+  cl_mps_.terminal_cost_weight_x    = opts_.terminal_cost_weight(0);  // 终端成本权重  x
+  cl_mps_.terminal_cost_weight_y    = opts_.terminal_cost_weight(1);  // 终端成本权重  y
+  cl_mps_.terminal_cost_weight_yaw  = opts_.terminal_cost_weight(2);  // 终端成本权重  yaw
+  cl_mps_.obstacle_cost_weight      = opts_.obstacle_cost_weight;     // 一般避障权重
+  cl_mps_.critical_weight           = opts_.critical_weight;          // 严重惩罚权重 (安全边距内)
+  cl_mps_.collision_cost            = opts_.collision_cost;           // 碰撞代价
+  cl_mps_.collision_margin_distance = opts_.collision_margin_distance;// 安全边距 (米)
+  cl_mps_.near_goal_distance        = opts_.near_goal_distance;       // 接近目标距离，此距离内停用一般避障项 unused
+  
+  u_prev_ = Eigen::Tensor<float, 2, Eigen::RowMajor>(opts_.step_T, opts_.dim_u);
   u_prev_.setZero();
 
-  epsilon_ = Eigen::Tensor<float, 3>(opts_.samples_K, opts_.step_T, opts_.dim_u);
+  epsilon_ = Eigen::Tensor<float, 3, Eigen::RowMajor>(opts_.samples_K, opts_.step_T, opts_.dim_u);
   epsilon_.setZero();
   
-  w_epsilon_ = Eigen::Tensor<float, 2>(opts_.step_T, opts_.dim_u);
+  w_epsilon_ = Eigen::Tensor<float, 2, Eigen::RowMajor>(opts_.step_T, opts_.dim_u);
   w_epsilon_.setZero();
 
   costs_ = Eigen::ArrayXf(opts_.samples_K);
@@ -660,6 +565,144 @@ void MPPIController::update_parameters(){
 
   RCLCPP_INFO(node_->get_logger(), "更新参数：frequency=%.2f, max_v=%.2f, max_w=%.2f, step_T=%zu, samples_K=%zu, lambda=%.2f, sigma_v=%.4f, sigma_w=%.4f",
     frequency, opts_.max_v, opts_.max_w, opts_.step_T, opts_.samples_K, opts_.lambda, sigma_v, sigma_w);
+}
+
+/********* OpenCL ******/
+
+char* MPPIController::read_kernel_file(const char* filename, size_t* length) {
+    FILE* fp = fopen(filename, "rb");
+    if (!fp) return NULL;
+    fseek(fp, 0, SEEK_END);                  // fseek 跳到文件末尾
+    *length = ftell(fp);                     // ftell 得到字节数 length
+    rewind(fp);                              // rewind 回到开头
+    char* src = (char*)malloc(*length + 1);  // malloc(length + 1) 多申请 1 字节用于存放字符串结束符 '\0'
+    fread(src, 1, *length, fp);              // fread 将整个文件读入内存
+    src[*length] = '\0';                     // src[*length] = '\0'，使内容成为合法的 C 字符串
+    fclose(fp);                              // 返回指向内存块的指针
+    return src;
+}
+
+void MPPIController::initOpenCL(){
+  // 1. 获取平台与设备
+  cl_ret_ = clGetPlatformIDs(1, &cl_platform_, nullptr);
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clGetPlatformIDs failed! " << cl_ret_;
+  cl_ret_ = clGetDeviceIDs(cl_platform_, CL_DEVICE_TYPE_GPU, 1, &cl_device_, nullptr);
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clGetDeviceIDs failed! " << cl_ret_;
+
+  // 2. 创建上下文和命令队列
+  cl_context_ = clCreateContext(nullptr, 1, &cl_device_, nullptr, nullptr, &cl_ret_);
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clCreateContext failed! " << cl_ret_;
+  cl_queue_ = clCreateCommandQueue(cl_context_, cl_device_, 0, &cl_ret_);
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clCreateCommandQueue failed! " << cl_ret_;
+
+  // 3. 加载并编译内核
+  size_t kernel_len;
+  char * kernel_src = read_kernel_file(cl_kernel_file_.c_str(), &kernel_len);
+  cl_program_ = clCreateProgramWithSource(cl_context_, 1, (const char **)&kernel_src, &kernel_len, &cl_ret_);
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clCreateProgramWithSource failed! " << cl_ret_;
+  free(kernel_src);
+  std::string options = "-I " + cl_mppi_params_dir_;
+  cl_ret_ = clBuildProgram(cl_program_, 1, &cl_device_, options.c_str(), nullptr, nullptr);
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clBuildProgram failed! " << cl_ret_;
+
+  // 4.创建内核对象
+  cl_kernel_ = clCreateKernel(cl_program_, cl_kernel_name_.c_str(), &cl_ret_);
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clCreateKernel failed! " << cl_ret_;
+
+  // 5.创建缓冲区
+  cl_u_prev_  = clCreateBuffer(cl_context_,
+    CL_MEM_READ_ONLY, sizeof(float) * opts_.step_T * opts_.dim_u, nullptr, &cl_ret_ );
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clCreateBuffer cl_u_prev_ failed! " << cl_ret_;
+  cl_costs_   = clCreateBuffer(cl_context_, 
+    CL_MEM_WRITE_ONLY, sizeof(float) * opts_.samples_K, nullptr, &cl_ret_);
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clCreateBuffer cl_costs_ failed! " << cl_ret_;
+  cl_epsilon_ = clCreateBuffer(cl_context_, 
+    CL_MEM_WRITE_ONLY, sizeof(float) * opts_.samples_K * opts_.step_T * opts_.dim_u, nullptr, &cl_ret_);
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clCreateBuffer cl_epsilon_ failed! " << cl_ret_;
+  cl_mps_buf_ = clCreateBuffer(cl_context_,
+    CL_MEM_READ_ONLY, sizeof(float) * 41, nullptr, &cl_ret_);
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clCreateBuffer cl_mps_buf_ failed! " << cl_ret_;
+  has_init_cl_ = true;
+}
+
+void MPPIController::releaseOpenCL(){
+  if (cl_u_prev_)      { clReleaseMemObject(cl_u_prev_);      cl_u_prev_ = nullptr; }
+  if (cl_costs_)       { clReleaseMemObject(cl_costs_);       cl_costs_ = nullptr; }
+  if (cl_epsilon_)     { clReleaseMemObject(cl_epsilon_);     cl_epsilon_ = nullptr; }
+  if (cl_path_points_) { clReleaseMemObject(cl_path_points_); cl_path_points_ = nullptr; }
+  if (cl_arc_lengths_) { clReleaseMemObject(cl_arc_lengths_); cl_arc_lengths_ = nullptr; }
+  if (cl_costmap_)     { clReleaseMemObject(cl_costmap_);     cl_costmap_ = nullptr; }
+  if (cl_mps_buf_)     { clReleaseMemObject(cl_mps_buf_);     cl_mps_buf_ = nullptr; }
+  if (cl_kernel_)      { clReleaseKernel(cl_kernel_);         cl_kernel_ = nullptr; }
+  if (cl_program_)     { clReleaseProgram(cl_program_);       cl_program_ = nullptr; }
+  if (cl_queue_)       { clReleaseCommandQueue(cl_queue_);    cl_queue_ = nullptr; }
+  if (cl_context_)     { clReleaseContext(cl_context_);       cl_context_ = nullptr; }
+  if (cl_device_)      { clReleaseDevice(cl_device_);         cl_device_ = nullptr; }
+  has_init_cl_ = false;
+}
+
+void MPPIController::copyPathToDevice(){
+  if ( path_points_size_ == 0 ) return;
+  if ( cl_path_points_ ) {
+    clReleaseMemObject( cl_path_points_ );
+    cl_path_points_ = nullptr;
+  }
+  if ( cl_arc_lengths_ ) {
+    clReleaseMemObject( cl_arc_lengths_ );
+    cl_arc_lengths_ = nullptr;
+  }
+  // 创建 buffer 同时拷贝数据
+  cl_path_points_ = clCreateBuffer(cl_context_,
+    CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * path_points_size_ * 3, path_points_.data(), &cl_ret_ );
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clCreateBuffer cl_path_points_ failed! " << cl_ret_;
+  cl_arc_lengths_ = clCreateBuffer(cl_context_,
+    CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, sizeof(float) * path_points_size_, path_arc_lengths_.data(), &cl_ret_ );
+  if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clCreateBuffer cl_arc_lengths_ failed! " << cl_ret_;
+
+  cl_mps_.path_points_size = path_points_size_;
+}
+
+void MPPIController::copyCostmapToDevice(){
+  if (!costmap_) return;
+  unsigned int size_x = costmap_->getSizeInCellsX();
+  unsigned int size_y = costmap_->getSizeInCellsY();
+  size_t map_bytes = size_x * size_y * sizeof(unsigned char);
+  // 如果大小改变或未分配，重新分配
+  if ( cl_costmap_ == nullptr || cl_mps_.costmap_size_x != (int)size_x || cl_mps_.costmap_size_y != (int)size_y ) {
+    if ( cl_costmap_ ) clReleaseMemObject( cl_costmap_ );
+    cl_costmap_ = nullptr;
+    // 创建新的缓冲区并拷贝数据
+    cl_costmap_ = clCreateBuffer(cl_context_,
+      CL_MEM_READ_ONLY | CL_MEM_COPY_HOST_PTR, map_bytes, costmap_->getCharMap(), &cl_ret_);
+    if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clCreateBuffer cl_costmap_ failed! " << cl_ret_;
+
+    cl_mps_.costmap_size_x = (int)size_x;
+    cl_mps_.costmap_size_y = (int)size_y;
+  } else {
+    // 拷贝数据
+    cl_ret_ = clEnqueueWriteBuffer(cl_queue_, cl_costmap_, CL_TRUE, 0, map_bytes, costmap_->getCharMap(), 0, nullptr, nullptr);
+    if ( cl_ret_ != CL_SUCCESS ) LOG(INFO) << "clEnqueueWriteBuffer costmap_ failed! " << cl_ret_;
+  }
+}
+
+
+void MPPIController::updateMPPIParams( const Vec3f &start_state ){
+  cl_mps_.use_obstacle_cost = static_cast<int>(opts_.use_obstacle_cost); // 1:true 0:false
+
+  cl_mps_.prev_waypoints_idx = prev_waypoints_idx_;
+  cl_mps_.start_x   = start_state.x();
+  cl_mps_.start_y   = start_state.y();
+  cl_mps_.start_yaw = start_state.z();
+
+  // costmap 部分的参数
+  cl_mps_.costmap_cost_scaling_factor = opts_.cost_scaling_factor;
+  cl_mps_.costmap_inflation_radius    = opts_.inflation_radius;
+  cl_mps_.costmap_inscribed_radius    = costmap_ros_->getLayeredCostmap()->getInscribedRadius();
+  cl_mps_.costmap_origin_x            = costmap_->getOriginX();
+  cl_mps_.costmap_origin_y            = costmap_->getOriginY();
+  cl_mps_.costmap_resolution          = costmap_->getResolution();
+
+  clEnqueueWriteBuffer(cl_queue_, cl_mps_buf_, CL_TRUE, 0, 4*41, &cl_mps_, 0, nullptr, nullptr);
 }
 
 } // namespace rm_mppi_controller
